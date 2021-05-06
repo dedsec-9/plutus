@@ -2370,17 +2370,7 @@
                                       (vardecl
                                         fail (fun (all a (type) a) Ordering)
                                       )
-                                      (lam
-                                        ds
-                                        (all a (type) a)
-                                        (let
-                                          (nonrec)
-                                          (typebind
-                                            (tyvardecl e (type)) Ordering
-                                          )
-                                          (error e)
-                                        )
-                                      )
+                                      (lam ds (all a (type) a) (error Ordering))
                                     )
                                     [
                                       [
