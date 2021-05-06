@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs            #-}
 {-# LANGUAGE LambdaCase       #-}
+{-# LANGUAGE TemplateHaskell  #-}
 {-# LANGUAGE TypeFamilies     #-}
 {-# LANGUAGE TypeOperators    #-}
 {-|
@@ -14,13 +15,17 @@ module PlutusIR.Transform.Inline (inline) where
 
 import           PlutusIR
 import qualified PlutusIR.Analysis.Dependencies as Deps
+import           PlutusIR.Mark
 import           PlutusIR.MkPir
 import           PlutusIR.Purity
+import           PlutusIR.Transform.Rename      ()
 import           PlutusPrelude
 
 import qualified PlutusCore                     as PLC
 import qualified PlutusCore.Constant.Meaning    as PLC
 import           PlutusCore.Name
+import           PlutusCore.Quote
+import           PlutusCore.Subst               (typeSubstTyNamesM)
 
 import           Control.Lens                   hiding (Strict)
 import           Control.Monad.Reader
@@ -77,8 +82,22 @@ newtype InlineTerm tyname name uni fun a = Done (Term tyname name uni fun a)
 newtype TermEnv tyname name uni fun a = TermEnv { _unTermEnv :: UniqueMap TermUnique (InlineTerm tyname name uni fun a) }
     deriving newtype (Semigroup, Monoid)
 
-newtype Subst tyname name uni fun a = Subst { _sTermEnv :: TermEnv tyname name uni fun a }
+newtype TypeEnv tyname uni a = TypeEnv { _unTypeEnv :: UniqueMap TypeUnique (Type tyname uni a) }
     deriving newtype (Semigroup, Monoid)
+
+data Subst tyname name uni fun a = Subst { _termEnv :: TermEnv tyname name uni fun a
+                                         , _typeEnv :: TypeEnv tyname uni a
+                                         }
+
+makeLenses ''TermEnv
+makeLenses ''TypeEnv
+makeLenses ''Subst
+
+instance Semigroup (Subst tyname name uni fun a) where
+    (Subst a b) <> (Subst c d) = Subst (a <> c) (b <> d)
+
+instance Monoid (Subst tyname name uni fun a) where
+    mempty = Subst mempty mempty
 
 type ExternalConstraints tyname name uni fun =
     ( HasUnique name TermUnique
@@ -89,22 +108,39 @@ type ExternalConstraints tyname name uni fun =
 type Inlining tyname name uni fun a m =
     ( MonadState (Subst tyname name uni fun a) m
     , MonadReader Deps.StrictnessMap m
-    , ExternalConstraints tyname name uni fun)
+    , MonadQuote m
+    , ExternalConstraints tyname name uni fun
+    )
 
-lookupSubst
+lookupTerm
     :: (HasUnique name TermUnique)
     => name
     -> Subst tyname name uni fun a
     -> Maybe (InlineTerm tyname name uni fun a)
-lookupSubst n (Subst (TermEnv env)) = lookupName n env
+lookupTerm n subst = lookupName n $ subst ^. termEnv . unTermEnv
 
-extendSubst
+extendTerm
     :: (HasUnique name TermUnique)
     => name
     -> InlineTerm tyname name uni fun a
     -> Subst tyname name uni fun a
     -> Subst tyname name uni fun a
-extendSubst n clos (Subst (TermEnv env)) = Subst $ TermEnv $ insertByName n clos env
+extendTerm n clos subst = subst & termEnv . unTermEnv %~ insertByName n clos
+
+lookupType
+    :: (HasUnique tyname TypeUnique)
+    => tyname
+    -> Subst tyname name uni fun a
+    -> Maybe (Type tyname uni a)
+lookupType tn subst = lookupName tn $ subst ^. typeEnv . unTypeEnv
+
+extendType
+    :: (HasUnique tyname TypeUnique)
+    => tyname
+    -> Type tyname uni a
+    -> Subst tyname name uni fun a
+    -> Subst tyname name uni fun a
+extendType tn ty subst = subst &  typeEnv . unTypeEnv %~ insertByName tn ty
 
 {- Note [Inlining and global uniqueness]
 Inlining relies on global uniqueness (we store things in a unique map), and *does* currently
@@ -126,7 +162,10 @@ inline t =
         -- We actually just want the variable strictness information here!
         deps :: (G.Graph Deps.Node, Map.Map PLC.Unique Strictness)
         deps = Deps.runTermDeps t
-    in flip runReader (snd deps) $ flip evalStateT mempty $ processTerm t
+    in flip runReader (snd deps) $ flip evalStateT mempty $ runQuoteT $ do
+        -- Ensure that we can safely rename inside that term
+        markNonFreshTerm t
+        processTerm t
 
 {- Note [Removing inlined bindings]
 We *do* remove bindings that we inline (since we only do unconditional inlining). We *could*
@@ -144,29 +183,38 @@ processTerm
     :: Inlining tyname name uni fun a m
     => Term tyname name uni fun a
     -> m (Term tyname name uni fun a)
-processTerm = \case
-    v@(Var _ n) -> do
+processTerm = handleTerm <=< traverseOf termSubtypes applySubstitution where
+    handleTerm = \case
+        v@(Var _ n) -> do
+            subst <- get
+            pure $ case lookupTerm n subst of
+                -- Not substituted for, leave it as it is
+                Nothing       -> v
+                -- Already processed term, just put it in, don't do any further optimization here.
+                -- See Note [Inlining approach and 'Secrets of the GHC Inliner']
+                -- NOTE:  We need to rename it to avoid variable capture
+                Just (Done t) -> t
+        Let a NonRec bs t -> do
+            -- Process bindings, eliminating those which will be inlined unconditionally,
+            -- and accumulating the new substitutions
+            -- See Note [Removing inlined bindings]
+            -- Note that we don't *remove* the bindings or scope the state, so the state will carry over
+            -- into "sibling" terms. This is fine because we have global uniqueness
+            -- (see Note [Inlining and global uniqueness]), if somewhat wasteful.
+            bs' <- wither processSingleBinding (toList bs)
+            t' <- processTerm t
+            -- Use 'mkLet': we're using lists of bindings rather than NonEmpty since we might actually
+            -- have got rid of all of them!
+            pure $ mkLet a NonRec bs' t'
+        -- This includes recursive let terms, we don't even consider inlining them at the moment
+        t -> forMOf termSubterms t processTerm
+    applySubstitution = typeSubstTyNamesM substFreshenedType
+    substFreshenedType name = do
         subst <- get
-        pure $ case lookupSubst n subst of
-            -- Not substituted for, leave it as it is
-            Nothing       -> v
-            -- Already processed term, just put it in, don't do any further optimization here.
-            -- See Note [Inlining approach and 'Secrets of the GHC Inliner']
-            Just (Done t) -> t
-    Let a NonRec bs t -> do
-        -- Process bindings, eliminating those which will be inlined unconditionally,
-        -- and accumulating the new substitutions
-        -- See Note [Removing inlined bindings]
-        -- Note that we don't *remove* the bindings or scope the state, so the state will carry over
-        -- into "sibling" terms. This is fine because we have global uniqueness
-        -- (see Note [Inlining and global uniqueness]), if somewhat wasteful.
-        bs' <- wither processSingleBinding (toList bs)
-        t' <- processTerm t
-        -- Use 'mkLet': we're using lists of bindings rather than NonEmpty since we might actually
-        -- have got rid of all of them!
-        pure $ mkLet a NonRec bs' t'
-    -- This includes recursive let terms, we don't even consider inlining them at the moment
-    t -> forMOf termSubterms t processTerm
+        case lookupType name subst of
+            Nothing -> pure Nothing
+            Just t  -> PLC.rename t <&> Just
+
 
 {- Note [Inlining various kinds of binding]
 We can inline term and type bindings, we can't do anything with datatype bindings.
@@ -184,6 +232,9 @@ processSingleBinding = \case
     TermBind a s v@(VarDecl _ n _) rhs -> do
         maybeRhs' <- maybeAddSubst s n rhs
         pure $ TermBind a s v <$> maybeRhs'
+    TypeBind _ (TyVarDecl _ tn _) rhs -> do
+        modify' (extendType tn rhs)
+        pure Nothing
     -- Not a strict binding, just process all the subterms
     b -> Just <$> forMOf bindingSubterms b processTerm
 
@@ -199,7 +250,7 @@ maybeAddSubst s n rhs = do
     rhs' <- processTerm rhs
     doInline <- postInlineUnconditional s rhs'
     if doInline then do
-        modify (\subst -> extendSubst n (Done rhs') subst)
+        modify (\subst -> extendTerm n (Done rhs') subst)
         pure Nothing
     else pure $ Just rhs'
 
