@@ -11,9 +11,7 @@ import           PlutusIR.Core
 
 import           Control.Lens
 import           Data.Set             as Set
-
-setOf :: Getting (Set a) s a -> s -> Set a
-setOf g = foldMapOf g singleton
+import           Data.Set.Lens        (setOf)
 
 uniquesTerm
     :: PLC.HasUniques (Term tyname name uni fun ann)
