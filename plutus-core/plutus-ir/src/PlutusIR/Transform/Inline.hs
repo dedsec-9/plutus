@@ -33,6 +33,7 @@ import           Control.Monad.State
 
 import qualified Algebra.Graph                  as G
 import qualified Data.Map                       as Map
+import           Data.Semigroup.Generic         (GenericSemigroupMonoid (..))
 import           Witherable
 
 {- Note [Inlining approach and 'Secrets of the GHC Inliner']
@@ -88,16 +89,18 @@ newtype TypeEnv tyname uni a = TypeEnv { _unTypeEnv :: UniqueMap TypeUnique (Typ
 data Subst tyname name uni fun a = Subst { _termEnv :: TermEnv tyname name uni fun a
                                          , _typeEnv :: TypeEnv tyname uni a
                                          }
+    deriving stock (Generic)
+    deriving (Semigroup, Monoid) via (GenericSemigroupMonoid (Subst tyname name uni fun a))
 
 makeLenses ''TermEnv
 makeLenses ''TypeEnv
 makeLenses ''Subst
 
-instance Semigroup (Subst tyname name uni fun a) where
-    (Subst a b) <> (Subst c d) = Subst (a <> c) (b <> d)
+-- instance Semigroup (Subst tyname name uni fun a) where
+--     (Subst a b) <> (Subst c d) = Subst (a <> c) (b <> d)
 
-instance Monoid (Subst tyname name uni fun a) where
-    mempty = Subst mempty mempty
+-- instance Monoid (Subst tyname name uni fun a) where
+--     mempty = Subst mempty mempty
 
 type ExternalConstraints tyname name uni fun =
     ( HasUnique name TermUnique
